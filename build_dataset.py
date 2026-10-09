@@ -3,11 +3,10 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 def main():
-    VOCAB_SIZE = 32000
+    VOCAB_SIZE = 16000
     OUTPUT_DATA_FILE = "mixed_dialogues.txt"
     OUTPUT_VOCAB_FILE = "vocabulary.txt"
     
-    # Лимиты символов под SRC_LEN=128 и TGT_LEN=128
     MAX_CHARS_LIMIT = 750   
 
     # Глобальный баланс 40% Ума / 60% Разговора (Суммарно 150 000 пар)

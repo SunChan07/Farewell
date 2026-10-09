@@ -12,11 +12,11 @@ from torch.utils.checkpoint import checkpoint
 from hp_layer import HPConfig, HPLinear
 
 PAD_ID, UNK_ID, EOS_ID = 0, 1, 2
-SRC_LEN, TGT_LEN = 128, 128  # длина вопроса / максимальная длина ответа в токенах (ответ заканчивается EOS)
+SRC_LEN, TGT_LEN = 128, 128
 
 
 def pick_device():
-    """CUDA -> DirectML (AMD) -> CPU. Без побочных эффектов при импорте."""
+    """CUDA -> DirectML (AMD) -> CPU."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     try:
@@ -32,9 +32,7 @@ def pick_device():
 # Токенизатор
 # ======================================================================================
 class DynamicTokenizer:
-    def __init__(self, base_words_count=30000, filepath="vocabulary.txt"):
-        # base_words_count - максимальный размер словаря. Раньше словарь заполнялся 14к заглушками
-        # 'слово_N', из-за чего все реальные слова датасета превращались в <UNK> и модель училась на мусоре.
+    def __init__(self, base_words_count=16000, filepath="vocabulary.txt"):
         self.base_limit = base_words_count
         self.filepath = filepath
         self.word2id = {"<PAD>": PAD_ID, "<UNK>": UNK_ID, "<EOS>": EOS_ID}
@@ -45,7 +43,6 @@ class DynamicTokenizer:
             self.inject_real_phrases()
 
     def build_from_texts(self, texts, min_count=2):
-        """Добавляет в словарь слова корпуса по убыванию частоты (редкие слова остаются <UNK>)."""
         counts = Counter(w for t in texts for w in self.clean_text(t))
         for w, c in counts.most_common():
             if c < min_count or self.vocab_size >= self.base_limit:
@@ -187,7 +184,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(0)]
 
 class SalatnicaLanguageModel(nn.Module):
-    def __init__(self, vocab_size, embedding_dim=768, hidden_dim=1536, src_len=SRC_LEN, tgt_len=TGT_LEN,
+    def __init__(self, vocab_size, embedding_dim=768, hidden_dim=1024, src_len=SRC_LEN, tgt_len=TGT_LEN,
                  dropout=0.1, hp_cfg: HPConfig = None, use_checkpoint=False):
         super().__init__()
         self.src_len, self.tgt_len = src_len, tgt_len
@@ -199,20 +196,20 @@ class SalatnicaLanguageModel(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=PAD_ID)
         self.pos_encoder = PositionalEncoding(embedding_dim, max_len=max(src_len, tgt_len))
-        
+
         self.encoder_proj = HPLinear(embedding_dim, embedding_dim, cfg=cfg)
-        
-        self.num_layers = 6
+
+        self.num_layers = 16
         self.decoder_layers = nn.ModuleList([
             HPTransformerDecoderLayer(
-                embed_dim=embedding_dim, 
-                num_heads=12, 
-                dim_feedforward=hidden_dim, 
-                dropout=dropout, 
+                embed_dim=embedding_dim,
+                num_heads=12,
+                dim_feedforward=hidden_dim,
+                dropout=dropout,
                 cfg=cfg
             ) for _ in range(self.num_layers)
         ])
-        
+
         self.output_head = nn.Linear(embedding_dim, vocab_size)
         self.dropout = nn.Dropout(dropout)
 
@@ -277,178 +274,124 @@ class SalatnicaLanguageModel(nn.Module):
     def forward(self, input_ids, target_ids=None):
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
-        
+
         memory = self._encode(input_ids)
         memory_mask = (input_ids != PAD_ID).to(input_ids.device)
 
         if target_ids is None:
-            return self.generate_logits_eval(input_ids, memory, memory_mask)
+            return self.generate_fast(input_ids)
 
         if target_ids.dim() == 1:
             target_ids = target_ids.unsqueeze(0)
-            
+
         start = torch.full_like(target_ids[:, :1], EOS_ID)
         dec_input = torch.cat((start, target_ids[:, :-1]), dim=1)
-        
+
         tgt_emb = self.embedding(dec_input).transpose(0, 1)
         tgt_emb = self.pos_encoder(tgt_emb * math.sqrt(self.embedding_dim))
         tgt_mask = generate_combined_mask(dec_input, PAD_ID).to(input_ids.device)
-        
-        out = tgt_emb
-        for layer in self.decoder_layers:
-            out = layer(out, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
-            
-        seq_len, bsz, emb_dim = out.size()
-        logits = self.output_head(out.reshape(-1, emb_dim)).reshape(seq_len, bsz, -1)
-        return logits
 
-    def generate_logits_eval(self, input_ids, memory, memory_mask):
-        bsz = input_ids.size(0)
-        tok = torch.full((bsz, 1), EOS_ID, dtype=torch.long, device=input_ids.device)
-        outputs = []
-        
-        for t in range(self.tgt_len):
-            tgt_emb = self.embedding(tok).transpose(0, 1)
-            tgt_emb = self.pos_encoder(tgt_emb * math.sqrt(self.embedding_dim))
-            tgt_mask = generate_causal_mask(t + 1, input_ids.device)
-            
-            out = tgt_emb
+        out = tgt_emb
+        if self.training:
+            from torch.utils.checkpoint import checkpoint
+
+            for layer in self.decoder_layers:
+                def create_custom_forward(l):
+                    def custom_forward(x, mem, t_mask, m_mask):
+                        return l(x, mem, tgt_mask=t_mask, memory_mask=m_mask)
+                    return custom_forward
+
+                out = checkpoint(create_custom_forward(layer), out, memory, tgt_mask, memory_mask, use_reentrant=False)
+        else:
             for layer in self.decoder_layers:
                 out = layer(out, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
-                
-            logits = self.output_head(out[-1, :, :])
-            outputs.append(logits)
-            
-            next_tok = logits.argmax(dim=-1).unsqueeze(1)
-            tok = torch.cat((tok, next_tok), dim=1)
-            
-        return torch.stack(outputs)
 
-    @staticmethod
-    def _sample_filtered(logits, temperature, top_p, min_p):
-        if temperature <= 0:
-            return int(logits.argmax(dim=-1).item())
-        probs = torch.softmax(logits / temperature, dim=-1)
-        if min_p > 0:
-            max_p = probs.max()
-            probs = torch.where(probs >= min_p * max_p, probs, torch.zeros_like(probs))
-            if probs.sum() == 0:
-                probs = torch.softmax(logits, dim=-1)
-        sorted_p, sorted_i = probs.sort(descending=True)
-        cumsum_p = sorted_p.cumsum(dim=-1)
-        outside = cumsum_p - sorted_p > top_p
-        sorted_p = sorted_p.masked_fill(outside, 0.0)
-        if sorted_p.sum() <= 0:
-            return int(sorted_i.item())
-        probs = torch.zeros_like(probs).scatter(0, sorted_i, sorted_p)
-        return int(torch.multinomial(probs / probs.sum(), 1).item())
+        seq_len, bsz, emb_dim = out.size()
+        logits = self.output_head(out.reshape(-1, emb_dim)).view(seq_len, bsz, -1)
+        return logits.permute(1, 2, 0)
 
     @torch.no_grad()
-    def generate(self, input_ids, temperature=0.6, top_p=0.90, min_p=0.01, 
-                 repetition_penalty=1.2, stop_confidence=0.0, min_tokens=5, 
-                 max_new_tokens=20, n_candidates=1, banned_ids=None, return_confidence=False):
+    def generate_fast(self, input_ids, max_new_tokens=40, temperature=0.6, top_p=0.90, repetition_penalty=1.2, min_tokens=5):
         was_training = self.training
         self.eval()
-        
+
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
-            
-        max_new = max_new_tokens or self.tgt_len
-        banned = torch.tensor(sorted(set(banned_ids or [])), dtype=torch.long, device=input_ids.device)
-        
+        bsz = input_ids.size(0)
+
         memory = self._encode(input_ids)
         memory_mask = (input_ids != PAD_ID).to(input_ids.device)
-        
-        best, best_score = [], -float("inf")
-        
-        for _ in range(n_candidates):
-            tok = torch.full((1, 1), EOS_ID, dtype=torch.long, device=input_ids.device)
-            ids, logps = [], []
-            
-            for t in range(max_new):
-                tgt_emb = self.embedding(tok).transpose(0, 1)
-                tgt_emb = self.pos_encoder(tgt_emb * math.sqrt(self.embedding_dim))
-                tgt_mask = generate_causal_mask(t + 1, input_ids.device)
-                
-                out = tgt_emb
-                for layer in self.decoder_layers:
-                    out = layer(out, memory, tgt_mask=tgt_mask, memory_mask=memory_mask)
-                    
-                logits = self.output_head(out[-1, :, :]).float().squeeze(0)
-                
-                logits[PAD_ID] = logits[UNK_ID] = -float("inf")
-                if banned.numel():
-                    logits[banned] = -float("inf")
-                if len(ids) < min_tokens:
-                    logits[EOS_ID] = -float("inf")
-                
-                if repetition_penalty != 0:
-                    for used in set(ids):
-                        logits[used] -= repetition_penalty
-                        
-                p_model = torch.softmax(logits, dim=-1)
-                if not torch.isfinite(p_model).all():
-                    break
-                    
-                if len(ids) >= min_tokens and float(p_model.max()) < stop_confidence:
-                    break
-                    
-                word = self._sample_filtered(logits, temperature, top_p, min_p)
-                logps.append(math.log(float(p_model[word]) + 1e-9))
-                
-                if word == EOS_ID:
-                    break
-                    
-                ids.append(word)
-                next_tok = torch.tensor([[word]], dtype=torch.long, device=input_ids.device)
-                tok = torch.cat((tok, next_tok), dim=1)
-                
-            if ids:
-                mean_lp = sum(logps) / len(logps)
-                if mean_lp > best_score:
-                    best, best_score = ids, mean_lp
-                    
+
+        current_tok = torch.full((bsz, 1), EOS_ID, dtype=torch.long, device=input_ids.device)
+        ids = []
+
+        past_key_values = [None] * self.num_layers
+
+        for t in range(max_new_tokens):
+            tgt_emb = self.embedding(current_tok).transpose(0, 1)
+
+            pe_slice = self.pos_encoder.pe[t:t+1]
+            tgt_emb = (tgt_emb * math.sqrt(self.embedding_dim)) + pe_slice
+
+            out = tgt_emb
+            new_past_key_values = []
+
+            for idx, layer in enumerate(self.decoder_layers):
+                out, next_kv = layer(out, memory, memory_mask=memory_mask, layer_past=past_key_values[idx])
+                new_past_key_values.append(next_kv)
+
+            past_key_values = new_past_key_values
+            logits = self.output_head(out[-1, :, :]).float()
+
+            logits[:, PAD_ID] = logits[:, UNK_ID] = -float("inf")
+            if len(ids) < min_tokens:
+                logits[:, EOS_ID] = -float("inf")
+
+            if repetition_penalty != 0 and ids:
+                for used in set(ids):
+                    logits[:, used] -= repetition_penalty
+
+            word = self._sample_filtered(logits.squeeze(0), temperature, top_p, min_p=0.01)
+            if word == EOS_ID:
+                break
+
+            ids.append(word)
+            current_tok = torch.tensor([[word]], dtype=torch.long, device=input_ids.device)
+
         self.train(was_training)
-        
-        if return_confidence:
-            return best, (math.exp(best_score) if best else 0.0)
-        return best
+        return ids
 
 # ======================================================================================
-# Тренер (не зависит от Ray - используется и в CLI, и в Trainable)
+# Тренер под Windows DirectML
 # ======================================================================================
 class FarewellTrainer:
     def __init__(self, data_path="mixed_dialogues.txt", vocab_path="vocabulary.txt",
-                 lr=3e-4, 
-                 weight_decay=0.05, 
+                 lr=6e-4,
+                 weight_decay=0.08,
                  hp_reg=0.02,
-                 dropout=0.2, 
+                 dropout=0.12,
                  mutation_rate=0.015,
-                 micro_batch=32,
-                 accum_steps=2,
+                 micro_batch=16, # Полная параллельная загрузка (Подходит для 12GB VRAM систем)
+                 accum_steps=16,   # Эффективный батч = 256
                  val_fraction=0.1,
-                 label_smoothing=0.15, 
+                 label_smoothing=0.15,
                  label_smoothing_end=0.03,
-                 total_epochs=15,
-                 warmup_frac=0.05, 
+                 total_epochs=5,  # Оптимум под 16 слоев на 100k строках
+                 warmup_frac=0.05,
                  min_lr_ratio=0.1,
-                 sparsity=0.4, 
-                 use_swa=True, 
-                 swa_start=0.72,
-                 seed=0, 
-                 device=None, 
-                 use_amp=True, 
-                 use_checkpoint=False):
+                 sparsity=0.4,
+                 use_swa=True,
+                 swa_start=0.80,  # Старт SWA на 4-й эпохе, после заморозки DST
+                 seed=0,
+                 device=None):
 
-        # total_epochs - горизонт обучения: от него зависят cosine-lr, замораживание DST и старт SWA.
-        # label_smoothing -> label_smoothing_end: смягчение меток линейно убывает (модель использует
-        # уверенность токена при генерации, поэтому к концу сглаживание ослабевает).
         self.device = device or pick_device()
-        self.amp = bool(use_amp and self.device.type == "cuda")  # 2080S: FP16 (BF16 не поддерживается аппаратно)
-        # Activation checkpointing на DirectML роняет процесс (0xC0000005) - включаем только на CUDA/CPU
-        use_checkpoint = bool(use_checkpoint and self.device.type != "privateuseone")
+        print(f"⚙️ [Аппаратная платформа]: Выбрано устройство {self.device}")
+
+        self.amp = False
+
         self.micro_batch, self.accum_steps = micro_batch, accum_steps
-        self.hp_reg = hp_reg  # сила HP-штрафа: сжатие слабых нейронов за эпоху (HPConfig.weak_decay)
+        self.hp_reg = hp_reg
         self.epoch = 0
         self.opt_step = 0
         self.total_epochs = max(1, total_epochs)
@@ -458,18 +401,34 @@ class FarewellTrainer:
         self.swa, self.swa_n = None, 0
 
         self.tokenizer = DynamicTokenizer(filepath=vocab_path)
-        pairs = load_external_dataset(data_path)
-        # Словарь строится по частоте слов корпуса; редкие слова -> <UNK> (без роста во время кодирования)
+
+        # ПРЯМОЙ ИДЕАЛЬНЫЙ ПАРСИНГ ТАБУЛЯЦИИ (Вопрос \t Ответ)
+        pairs = []
+        if os.path.exists(data_path):
+            with open(data_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "\t" in line:
+                        user_phrase, bot_phrase = line.strip().split("\t", 1)
+                        if user_phrase and bot_phrase:
+                            pairs.append({"user": user_phrase, "bot": bot_phrase})
+            print(f"📚 [Система данных]: Успешно загружено {len(pairs)} пар диалогов через табуляцию.")
+        else:
+            pairs = [{"user": "Привет!", "bot": "Система активирована."}]
+
         self.tokenizer.build_from_texts([p[k] for p in pairs for k in ("user", "bot")])
-        enc = [(self.tokenizer.encode(p["user"], max_len=SRC_LEN, grow=False),
-                self.tokenizer.encode(p["bot"], max_len=TGT_LEN, grow=False)) for p in pairs]
+
+        enc_inputs = []
+        enc_targets = []
+        for p in pairs:
+            enc_inputs.append(self.tokenizer.encode(p["user"], max_len=SRC_LEN, grow=False))
+            enc_targets.append(self.tokenizer.encode(p["bot"], max_len=TGT_LEN, grow=False))
+
         if self.tokenizer.dirty:
             self.tokenizer.save_vocab()
-        print(f"📖 [Токенизатор]: Итоговый размер словаря после обработки датасета: {self.tokenizer.vocab_size}")
-        inputs = torch.stack([e[0] for e in enc])
-        targets = torch.stack([e[1] for e in enc])
 
-        # Валидационная выборка с фиксированным seed (одна и та же у всех трайлов PBT)
+        inputs = torch.stack(enc_inputs)
+        targets = torch.stack(enc_targets)
+
         g = torch.Generator().manual_seed(1234)
         perm = torch.randperm(len(inputs), generator=g)
         n_val = max(1, int(len(inputs) * val_fraction)) if len(inputs) > 10 else 0
@@ -478,48 +437,45 @@ class FarewellTrainer:
 
         torch.manual_seed(seed)
         random.seed(seed)
+
         hp_cfg = HPConfig(mutation_rate=mutation_rate, weak_decay=hp_reg, sparsity=sparsity)
+
+        # Инициализируем обновленную 16-слойную модель
         self.model = SalatnicaLanguageModel(
-            self.tokenizer.vocab_size, dropout=dropout, hp_cfg=hp_cfg, use_checkpoint=use_checkpoint
+            self.tokenizer.vocab_size, dropout=dropout, hp_cfg=hp_cfg, use_checkpoint=False
         ).to(self.device)
-        # SWA усредняет веса только после замораживания топологии DST (иначе смесь разных масок разуплотнит сеть)
+
         self.swa_start = max(swa_start, hp_cfg.dst_stop + 0.02) if sparsity > 0 else swa_start
 
         steps_per_epoch = math.ceil(math.ceil(self.train_x.size(0) / micro_batch) / accum_steps)
         self.total_steps = self.total_epochs * steps_per_epoch
         self.warmup_steps = max(10, int(warmup_frac * self.total_steps))
 
-        # Weight decay только на матрицы весов; bias и embedding не затягиваем (стандартная практика AdamW)
         decay, no_decay = [], []
         for name, p in self.model.named_parameters():
             (decay if p.ndim >= 2 and not name.startswith("embedding") else no_decay).append(p)
-        self.optimizer = torch.optim.AdamW([
+
+        self.optimizer = torch.optim.SGD([
             {"params": decay, "weight_decay": weight_decay, "decay": True},
             {"params": no_decay, "weight_decay": 0.0, "decay": False},
-        ], lr=lr)
-        self._apply_lr()
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
-        # PAD не должен давать вклад в loss (раньше сеть училась предсказывать паддинг)
+        ], lr=lr, momentum=0.9, nesterov=True)
+
         self.criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=label_smoothing)
-        # Валидация без сглаживания - честный CE, сравнимый между эпохами и трайлами PBT
         self.eval_criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 
-    # ---------- гиперпараметры (PBT меняет их на лету) ----------
     def set_hparams(self, lr=None, weight_decay=None, hp_reg=None, mutation_rate=None):
         if lr is not None:
-            self.base_lr = lr  # пиковый lr; warmup+cosine масштабируется поверх него
+            self.base_lr = lr
             self._apply_lr()
         if weight_decay is not None:
             for g in self.optimizer.param_groups:
-                if g.get("decay"):
-                    g["weight_decay"] = weight_decay
+                if g.get("decay"): g["weight_decay"] = weight_decay
         if hp_reg is not None:
             self.hp_reg = hp_reg
             self.model.set_weak_decay(hp_reg)
         if mutation_rate is not None:
             self.model.set_mutation_rate(mutation_rate)
 
-    # ---------- расписание lr: linear warmup -> cosine ----------
     def lr_scale(self, step=None):
         step = self.opt_step if step is None else step
         if step < self.warmup_steps:
@@ -535,7 +491,6 @@ class FarewellTrainer:
     def progress(self):
         return min(1.0, self.opt_step / max(1, self.total_steps))
 
-    # ---------- SWA (усреднение весов по эпохам в хвосте обучения) ----------
     @torch.no_grad()
     def swa_update(self):
         params = dict(self.model.named_parameters())
@@ -548,7 +503,6 @@ class FarewellTrainer:
 
     @contextmanager
     def swa_weights(self):
-        """Временно подменяет веса модели усреднёнными."""
         params = dict(self.model.named_parameters())
         backup = {n: p.detach().clone() for n, p in params.items()}
         with torch.no_grad():
@@ -558,36 +512,24 @@ class FarewellTrainer:
             yield
         finally:
             with torch.no_grad():
-                for n, p in params.items():
-                    p.copy_(backup[n])
+                for n, p in params.items(): p.copy_(backup[n])
 
     def evaluate_swa(self):
-        if self.swa is None:
-            return float("nan")
-        with self.swa_weights():
-            return self.evaluate()
+        if self.swa is None: return float("nan")
+        with self.swa_weights(): return self.evaluate()
 
     @torch.no_grad()
     def apply_swa(self):
-        """Навсегда подставляет усреднённые веса в модель."""
         for n, p in self.model.named_parameters():
             p.copy_(self.swa[n].to(p.dtype))
 
-    # ---------- обучение ----------
-    def _autocast(self):
-        return torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp)
-
     def _optimizer_step(self):
         self._apply_lr()
-        self.scaler.unscale_(self.optimizer)
         gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        finite = bool(torch.isfinite(gn))
-        if finite:
-            self.model.hp_accumulate()  # статистика HP и плотный градиент для DST по реальным (unscaled) градиентам
-            self.model.hp_mask_grads()  # выключенные связи не обновляются
-        if finite or self.amp:  # GradScaler сам пропустит шаг при inf/nan
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+        if torch.isfinite(gn):
+            self.model.hp_accumulate()
+            self.model.hp_mask_grads()
+            self.optimizer.step()
         self.model.hp_apply_masks()
         self.optimizer.zero_grad(set_to_none=True)
         self.opt_step += 1
@@ -604,11 +546,13 @@ class FarewellTrainer:
             idx = perm[i:i + self.micro_batch]
             x = self.train_x[idx].to(self.device)
             y = self.train_y[idx].to(self.device)
-            with self._autocast():
-                logits = self.model(x, y)
-            loss = self.criterion(logits.permute(1, 2, 0).float(), y)
-            self.scaler.scale(loss / self.accum_steps).backward()
+
+            logits = self.model(x, y)
+            loss = self.criterion(logits, y)
+
+            (loss / self.accum_steps).backward()
             total_loss += loss.item()
+
             if k % self.accum_steps == 0 or k == len(starts):
                 self._optimizer_step()
         return total_loss / len(starts)
@@ -622,26 +566,23 @@ class FarewellTrainer:
         for i in range(0, self.val_x.size(0), 16):
             x = self.val_x[i:i + 16].to(self.device)
             y = self.val_y[i:i + 16].to(self.device)
-            with self._autocast():
-                logits = self.model(x, y)
-            total += self.eval_criterion(logits.permute(1, 2, 0).float(), y).item()
+
+            logits = self.model(x, y)
+            total += self.eval_criterion(logits, y).item()
             batches += 1
         return total / batches
 
     def run_epoch(self):
-        """Одна эпоха: обучение -> валидация -> SWA -> эволюционный шаг HP/Покров + DST."""
         ls = self.ls_start + (self.ls_end - self.ls_start) * self.progress()
         self.criterion.label_smoothing = ls
         train_loss = self.train_epoch()
         val_loss = self.evaluate()
         progress = self.progress()
-        self.model.set_progress(progress)  # расписание DST (cos-спад и замораживание)
+        self.model.set_progress(progress)
         swa_val = float("nan")
         if self.use_swa and progress >= self.swa_start:
-            # снимок берём ДО мутаций этой эпохи, чтобы в среднее не попадал шум
             self.swa_update()
             swa_val = self.evaluate_swa()
-        # урон зависит от прогресса валидации (регресс/плато), а не от абсолютного loss
         score = val_loss if not math.isnan(val_loss) else train_loss
         obs = self.model.hp_observe(score)
         evo = self.model.hp_end_epoch(obs["severity"], self.optimizer)
@@ -655,19 +596,16 @@ class FarewellTrainer:
                 "noise_std": cfg.mutation_std, "mut_rate": cfg.mutation_rate,
                 **{f"hp_{k}": v for k, v in evo.items()}}
 
-    # ---------- чекпоинты ----------
     def state(self, with_optimizer=False):
         st = {"model": self.model.state_dict(), "epoch": self.epoch, "opt_step": self.opt_step,
               "hp_dynamics": self.model.hp_config.dynamics_state()}
-        if self.swa is not None:
-            st["swa"] = {"avg": self.swa, "n": self.swa_n}
-        if with_optimizer:
-            st["optimizer"] = self.optimizer.state_dict()
+        if self.swa is not None: st["swa"] = {"avg": self.swa, "n": self.swa_n}
+        if with_optimizer: st["optimizer"] = self.optimizer.state_dict()
         return st
 
     def load_state(self, st):
         sd = dict(st["model"])
-        for k, v in self.model.state_dict().items():  # старый чекпоинт без DST-масок -> плотные маски
+        for k, v in self.model.state_dict().items():
             if k.endswith(".mask") and k not in sd:
                 sd[k] = torch.ones_like(v)
         self.model.load_state_dict(sd)
@@ -682,12 +620,12 @@ class FarewellTrainer:
         if "optimizer" in st:
             self.optimizer.load_state_dict(st["optimizer"])
 
-
 # ======================================================================================
-# Локальный запуск: обучение + чат
+# Потоковый инференс и запуск системы
 # ======================================================================================
 def chat(trainer):
     model, tok, device = trainer.model, trainer.tokenizer, trainer.device
+    print("\n💬 [Когнитивный модуль активен]: Введите 'выход' для завершения.")
     while True:
         user_input = input("\n👤 Ты: ")
         if user_input.lower() in ["выход", "exit"]:
@@ -695,26 +633,25 @@ def chat(trainer):
         if not user_input.strip():
             continue
         ids = tok.encode(user_input, max_len=model.src_len, grow=False).to(device)
-        answer, conf = model.generate(ids, return_confidence=True)
-        print(f"🤖 Бот: {tok.decode(answer)}  [уверенность {conf:.0%}, токенов: {len(answer)}]")
 
+        answer = model.generate_fast(ids)
+        print(f"🤖 Бот: {tok.decode(answer)}  [Размер ответа: {len(answer)} токенов]")
 
 if __name__ == '__main__':
-    EPOCHS, PATIENCE = 15, 6
+    EPOCHS = 5
     WEIGHTS_FILE = "weights_v2.pth"
 
     trainer = FarewellTrainer(total_epochs=EPOCHS)
-    print(f"⚙️ Устройство: {trainer.device}, AMP: {trainer.amp}, "
-          f"эффективный батч: {trainer.micro_batch * trainer.accum_steps}")
+    print(f"⚙️ Эффективный батч: {trainer.micro_batch * trainer.accum_steps} пар диалогов за шаг")
 
     loaded = False
     if os.path.exists(WEIGHTS_FILE):
         try:
             trainer.load_state(torch.load(WEIGHTS_FILE, map_location="cpu", weights_only=True))
             loaded = True
-            print("--- СИСТЕМА ВОССТАНОВЛЕНА ИЗ АРХИВА ---")
+            print("--- КОГНИТИВНАЯ СИСТЕМА ВОССТАНОВЛЕНА ИЗ АРХИВА ---")
         except Exception as e:
-            print(f"⚠️ Не удалось загрузить {WEIGHTS_FILE} ({e}). Обучаем заново.")
+            print(f"⚠️ Чекпоинт {WEIGHTS_FILE} не подошел под структуру ({e}). Запуск чистого обучения.")
 
     if not loaded:
         best_val, best_state, bad = float("inf"), None, 0
@@ -726,26 +663,22 @@ if __name__ == '__main__':
                   f"мутаций={m['hp_mutated']} перерожд.={m['hp_reborn']} (в очереди {m['hp_pending']}) "
                   f"перестроено={m['hp_rewired']} плотн.={m['density']:.2f}")
             score = m["val_loss"] if not math.isnan(m["val_loss"]) else m["train_loss"]
-            if score < best_val:  # early stopping против переобучения
-                best_val, bad = score, 0
+            if score < best_val:
+                best_val = score
                 best_state = {k: v.detach().cpu().clone() for k, v in trainer.model.state_dict().items()}
-            else:
-                bad += 1
-                if bad >= PATIENCE:
-                    print("⏹ Ранняя остановка: валидация перестала улучшаться.")
-                    break
+
         final_masks = {k: v.clone() for k, v in trainer.model.state_dict().items() if k.endswith(".mask")}
         if best_state is not None:
             trainer.model.load_state_dict(best_state)
-        if trainer.swa_n > 0:  # SWA берём только если он не хуже лучшего одиночного чекпоинта
+        if trainer.swa_n > 0:
             swa_val = trainer.evaluate_swa()
             print(f"  SWA ({trainer.swa_n} снимков): val={swa_val:.4f}, лучшая эпоха: val={best_val:.4f}")
             if swa_val <= best_val:
-                trainer.model.load_state_dict(final_masks, strict=False)  # SWA усреднён по замороженной топологии
+                trainer.model.load_state_dict(final_masks, strict=False)
                 trainer.apply_swa()
-                print("  → используем усреднённые веса SWA")
+                print("  → Использованы усредненные веса SWA")
         torch.save(trainer.state(), WEIGHTS_FILE)
         trainer.tokenizer.save_vocab()
-        print("--- ОБУЧЕНИЕ ЗАВЕРШЕНО ---")
+        print("--- ОБУЧЕНИЕ МОДЕЛИ УСПЕШНО ЗАВЕРШЕНО ---")
 
     chat(trainer)
