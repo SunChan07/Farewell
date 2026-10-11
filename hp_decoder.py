@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from hp_layer import HPLinear, HPConfig
 from hp_attention import HPMultiHeadAttention

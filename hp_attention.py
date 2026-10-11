@@ -18,7 +18,7 @@ class HPMultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, query, key, value, attn_mask=None):
-        # Этот метод используется только во время ОБУЧЕНИЯ
+        # Этот метод используется только во время обучения
         tgt_len, bsz, embed_dim = query.size()
         src_len = key.size(0)
 

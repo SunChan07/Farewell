@@ -1,13 +1,11 @@
 import math
 import os
 import random
-import warnings
 from collections import Counter
 from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 from hp_layer import HPConfig, HPLinear
 
@@ -94,7 +92,6 @@ class DynamicTokenizer:
                     word = word.replace("<COLON>", ":")
                     self.word2id[word] = int(idx)
                     self.id2word[int(idx)] = word
-        # Убираем старые заглушки 'слово_N' и уплотняем id реальных слов (спецтокены - 0,1,2)
         specials = {"<PAD>": PAD_ID, "<UNK>": UNK_ID, "<EOS>": EOS_ID}
         real = sorted((idx, w) for w, idx in self.word2id.items()
                       if w not in specials and not w.startswith("слово_"))
@@ -130,7 +127,7 @@ class DynamicTokenizer:
             else:
                 ids.append(UNK_ID)
 
-        ids = ids[:max_len - 1] + [EOS_ID]  # EOS всегда в конце, даже у обрезанных длинных ответов
+        ids = ids[:max_len - 1] + [EOS_ID]
         ids = ids + [PAD_ID] * (max_len - len(ids))
         return torch.tensor(ids, dtype=torch.long)
 
@@ -311,7 +308,24 @@ class SalatnicaLanguageModel(nn.Module):
         return logits.permute(1, 2, 0)
 
     @torch.no_grad()
-    def generate_fast(self, input_ids, max_new_tokens=40, temperature=0.6, top_p=0.90, repetition_penalty=1.2, min_tokens=5):
+    def generate_fast(self, input_ids, max_new_tokens=60, temperature=0.1, top_p=0.50, repetition_penalty=1.5, min_tokens=3):
+        def _sample_filtered(logits, temperature=0.1, top_p=0.50, min_p=0.01):
+            import torch.nn.functional as F
+            if temperature > 0:
+                logits = logits / temperature
+            else:
+                return torch.argmax(logits, dim=-1).item()
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            logits[indices_to_remove] = -float("Inf")
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            return next_token.item()
+
         was_training = self.training
         self.eval()
 
@@ -325,8 +339,6 @@ class SalatnicaLanguageModel(nn.Module):
         current_tok = torch.full((bsz, 1), EOS_ID, dtype=torch.long, device=input_ids.device)
         ids = []
 
-        past_key_values = [None] * self.num_layers
-
         for t in range(max_new_tokens):
             tgt_emb = self.embedding(current_tok).transpose(0, 1)
 
@@ -334,24 +346,25 @@ class SalatnicaLanguageModel(nn.Module):
             tgt_emb = (tgt_emb * math.sqrt(self.embedding_dim)) + pe_slice
 
             out = tgt_emb
-            new_past_key_values = []
 
-            for idx, layer in enumerate(self.decoder_layers):
-                out, next_kv = layer(out, memory, memory_mask=memory_mask, layer_past=past_key_values[idx])
-                new_past_key_values.append(next_kv)
+            for layer in self.decoder_layers:
+                out = layer(out, memory, memory_mask=memory_mask)
 
-            past_key_values = new_past_key_values
             logits = self.output_head(out[-1, :, :]).float()
 
             logits[:, PAD_ID] = logits[:, UNK_ID] = -float("inf")
             if len(ids) < min_tokens:
                 logits[:, EOS_ID] = -float("inf")
 
-            if repetition_penalty != 0 and ids:
+            if repetition_penalty != 1.0 and ids:
                 for used in set(ids):
-                    logits[:, used] -= repetition_penalty
+                    if logits[0, used] > 0:
+                        logits[0, used] /= repetition_penalty
+                    else:
+                        logits[0, used] *= repetition_penalty
 
-            word = self._sample_filtered(logits.squeeze(0), temperature, top_p, min_p=0.01)
+
+            word = _sample_filtered(logits.squeeze(0), temperature, top_p, min_p=0.01)
             if word == EOS_ID:
                 break
 
@@ -362,7 +375,7 @@ class SalatnicaLanguageModel(nn.Module):
         return ids
 
 # ======================================================================================
-# Тренер под Windows DirectML
+# Обучение модели
 # ======================================================================================
 class FarewellTrainer:
     def __init__(self, data_path="mixed_dialogues.txt", vocab_path="vocabulary.txt",
@@ -371,7 +384,7 @@ class FarewellTrainer:
                  hp_reg=0.02,
                  dropout=0.12,
                  mutation_rate=0.015,
-                 micro_batch=16, # Полная параллельная загрузка (Подходит для 12GB VRAM систем)
+                 micro_batch=16,
                  accum_steps=16,   # Эффективный батч = 256
                  val_fraction=0.1,
                  label_smoothing=0.15,
@@ -381,7 +394,7 @@ class FarewellTrainer:
                  min_lr_ratio=0.1,
                  sparsity=0.4,
                  use_swa=True,
-                 swa_start=0.80,  # Старт SWA на 4-й эпохе, после заморозки DST
+                 swa_start=0.80,  # Старт SWA, после заморозки DST
                  seed=0,
                  device=None):
 
@@ -402,7 +415,6 @@ class FarewellTrainer:
 
         self.tokenizer = DynamicTokenizer(filepath=vocab_path)
 
-        # ПРЯМОЙ ИДЕАЛЬНЫЙ ПАРСИНГ ТАБУЛЯЦИИ (Вопрос \t Ответ)
         pairs = []
         if os.path.exists(data_path):
             with open(data_path, "r", encoding="utf-8") as f:
@@ -440,7 +452,6 @@ class FarewellTrainer:
 
         hp_cfg = HPConfig(mutation_rate=mutation_rate, weak_decay=hp_reg, sparsity=sparsity)
 
-        # Инициализируем обновленную 16-слойную модель
         self.model = SalatnicaLanguageModel(
             self.tokenizer.vocab_size, dropout=dropout, hp_cfg=hp_cfg, use_checkpoint=False
         ).to(self.device)
